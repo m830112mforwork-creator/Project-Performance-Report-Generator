@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HR 專案績效系統</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Inter', 'Noto Sans TC', sans-serif; margin: 0; background: #f4f7fb; }
+  .custom-scrollbar::-webkit-scrollbar { height: 6px; width: 6px; }
+  .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+  .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  .batch-pdf-area { position: fixed; top: 0; left: 200vw; z-index: -9999; pointer-events: none; visibility: hidden; }
+  .batch-pdf-area.rendering { visibility: visible; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .animate-spin { animation: spin 1s linear infinite; }
+  @keyframes bounce { 0%,100%{transform:translateY(-25%);animation-timing-function:cubic-bezier(.8,0,1,1)} 50%{transform:none;animation-timing-function:cubic-bezier(0,0,.2,1)} }
+  .animate-bounce { animation: bounce 1s infinite; }
+  @media print {
+    .no-print { display: none !important; }
+    @page { size: landscape; margin: 5mm; }
+    body { background: white; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .print-container { width: 100%; padding: 0; margin: 0; background: white; box-shadow: none !important; border: none !important; }
+    table { width: 100%; border-collapse: collapse; page-break-inside: auto; }
+    th { border-bottom: 2px solid #1e293b !important; color: #1e293b !important; background: transparent !important; padding: 8px 6px !important; font-weight: bold !important; font-size: 11px !important; white-space: nowrap !important; }
+    td { border-bottom: 1px solid #e2e8f0 !important; padding: 8px 6px !important; font-size: 11px !important; color: #334155 !important; }
+    tr { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useRef, useEffect } = React;
+
+// ─────────────────────────────────────────────
+// CSV 解析
+// ─────────────────────────────────────────────
+const parseCSV = (text) => {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const result = []; let row = [], val = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i], next = text[i + 1];
+    if (char === '"') {
+      if (inQuotes && next === '"') { val += '"'; i++; } else inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) { row.push(val); val = ''; }
+    else if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && next === '\n') i++;
+      row.push(val);
+      if (!row.every(c => !c || c.trim() === '')) result.push(row);
+      row = []; val = '';
+    } else val += char;
+  }
+  if (val !== '' || text[text.length - 1] === ',') row.push(val);
+  if (row.length > 0 && !row.every(c => !c || c.trim() === '')) result.push(row);
+  return result;
+};
+
+// ─────────────────────────────────────────────
+// Excel 解析
+// ─────────────────────────────────────────────
+const parseExcel = async (buffer) => {
+  const wb = window.XLSX.read(buffer, { type: 'array' });
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+  return aoa.filter(row => row.some(c => c !== null && c !== undefined && String(c).trim() !== ''));
+};
+
+// ─────────────────────────────────────────────
+// 欄位標準化
+// ─────────────────────────────────────────────
+const standardizeItem = (item) => {
+  const get = (...keys) => { for (const k of keys) { if (item[k] != null) return String(item[k]).trim(); } return '-'; };
+  const pRaw = get('SUM of Season P值數字','Season P值數字','P值','Season P值','配置數值(1-12)');
+  return {
+    ...item,
+    _standardName:            get('教師名字','姓名','員工姓名','Name').replace(/^-$/,''),
+    _standardProjectName:     get('專案名稱','專案','Project'),
+    _standardPValue:          pRaw === '-' ? '0' : pRaw,
+    _standardDepartment:      get('部門','Department'),
+    _standardProjectType:     get('專案屬性','Type'),
+    _standardCategory:        get('類別','Category'),
+    _standardAllocation:      get('專案配給','Allocation'),
+    _standardDispatchStatus:  get('派發狀況','Status').replace(/[✅✔]/g,'').trim(),
+    _standardEvaluationMethod:get('評價方式','Evaluation'),
+    _standardProjectManager:  get('專案負責人','負責人','Manager'),
+    _standardProjectItem:     get('專案項目/程序','Item'),
+    _standardDesc:            get('工作內容敘述','專案內容','Description'),
+    _standardRole:            get('身份','角色','Role'),
+    _standardExecutionPeriod: get('執行期間','Period'),
+    _standardSeason:          get('運作季節','Season'),
+  };
+};
+
+const rowsToData = (rows, fileName) => {
+  if (rows.length < 2) return [];
+  const headers = rows[0].map(h => h ? String(h).trim().replace(/^["']|["']$/g,'') : '未命名');
+  return rows.slice(1).map(row => {
+    const obj = { _fileName: fileName };
+    headers.forEach((h, i) => { obj[h] = row[i] != null ? String(row[i]).trim().replace(/^["']|["']$/g,'') : ''; });
+    return standardizeItem(obj);
+  }).filter(item => {
+    const nameOk = item._standardName && item._standardName !== '總計' && !item._standardName.includes('合計');
+    const projOk = item._standardProjectName && !item._standardProjectName.includes('合計');
+    return nameOk && projOk;
+  });
+};
+
+const pv  = str => parseFloat(String(str).replace(/,/g,'')) || 0;
+const fmt = n   => isNaN(n) ? n : Number(n).toFixed(2);
+
+// ─────────────────────────────────────────────
+// SVG Icons (自製，不依賴 lucide CDN)
+// ─────────────────────────────────────────────
+const Icon = ({ d, size = 16, className = '', style = {} }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24"
+    fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+    className={className} style={style}>
+    {Array.isArray(d) ? d.map((path, i) => <path key={i} d={path}/>) : <path d={d}/>}
+  </svg>
+);
+
+const icons = {
+  Upload:   "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12",
+  File:     "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
+  Users:    ["M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2","M23 21v-2a4 4 0 0 0-3-3.87","M16 3.13a4 4 0 0 1 0 7.75"],
+  Search:   ["M11 19A8 8 0 1 0 11 3a8 8 0 0 0 0 16z","M21 21l-4.35-4.35"],
+  Trash:    ["M3 6h18","M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"],
+  Chevron:  "M9 18l6-6-6-6",
+  Sheet:    ["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z","M14 2v6h6","M8 13h2","M8 17h2","M14 13h2","M14 17h2"],
+  Alert:    ["M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z","M12 9v4","M12 17h.01"],
+  Loader:   ["M12 2v4","M12 18v4","M4.93 4.93l2.83 2.83","M16.24 16.24l2.83 2.83","M2 12h4","M18 12h4","M4.93 19.07l2.83-2.83","M16.24 7.76l2.83-2.83"],
+  Filter:   "M22 3H2l8 9.46V19l4 2v-8.54L22 3z",
+  Download: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4","M7 10l5 5 5-5","M12 15V3"],
+  Briefcase:["M20 7H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z","M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"],
+  Star:     "M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z",
+  Layout:   ["M3 3h7v7H3z","M14 3h7v7h-7z","M14 14h7v7h-7z","M3 14h7v7H3z"],
+  Database: ["M12 2C8.13 2 5 3.79 5 6s3.13 4 7 4 7-1.79 7-4-3.13-4-7-4z","M5 6v4c0 2.21 3.13 4 7 4s7-1.79 7-4V6","M5 10v4c0 2.21 3.13 4 7 4s7-1.79 7-4v-4"],
+  PieChart: ["M21.21 15.89A10 10 0 1 1 8 2.83","M22 12A10 10 0 0 0 12 2v10z"],
+  User:     ["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2","M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"],
+  Building: ["M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z","M9 22V12h6v10"],
+  CloudDl:  ["M8 17l4 4 4-4","M12 12v9","M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"],
+};
+
+// ─────────────────────────────────────────────
+// 主應用程式
+// ─────────────────────────────────────────────
+function App() {
+  const [data,             setData]             = useState([]);
+  const [uploadedFiles,    setUploadedFiles]    = useState([]);
+  const [viewMode,         setViewMode]         = useState('employee');
+  const [selectedEmployee, setSelectedEmployee] = useState('');
+  const [selectedProject,  setSelectedProject]  = useState('');
+  const [searchTerm,       setSearchTerm]       = useState('');
+  const [selectedDept,     setSelectedDept]     = useState('All');
+  const [errorMsg,         setErrorMsg]         = useState('');
+  const [isLoading,        setIsLoading]        = useState(false);
+  const [isExportingPDF,   setIsExportingPDF]   = useState(false);
+  const [batchPhase,       setBatchPhase]       = useState('idle'); // idle|rendering|exporting
+  const [batchProgress,    setBatchProgress]    = useState({ current: 0, total: 0 });
+  const [deptUnlocked,     setDeptUnlocked]     = useState(false);
+  const [showPwdModal,     setShowPwdModal]     = useState(false);
+  const [pwdInput,         setPwdInput]         = useState('');
+  const [pwdError,         setPwdError]         = useState(false);
+  const DEPT_PASSWORD = '7777777';
+
+  const fileInputRef  = useRef(null);
+  const singleExpRef  = useRef(null);
+  const batchRefs     = useRef({});
+
+  // ── 批次匯出：兩段式 useEffect ──
+  useEffect(() => {
+    if (batchPhase !== 'rendering') return;
+    let r1, r2;
+    r1 = requestAnimationFrame(() => { r2 = requestAnimationFrame(() => setBatchPhase('exporting')); });
+    return () => { cancelAnimationFrame(r1); cancelAnimationFrame(r2); };
+  }, [batchPhase]);
+
+  useEffect(() => { if (batchPhase === 'exporting') runBatchExport(); }, [batchPhase]);
+
+  // ── 檔案上傳 ──
+  const handleFileUpload = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    setIsLoading(true); setErrorMsg('');
+    const newFiles = [], allData = [...data];
+
+    for (const file of files) {
+      if (uploadedFiles.some(f => f.name === file.name)) continue;
+      const ext = file.name.split('.').pop().toLowerCase();
+      try {
+        let rows = [];
+        if (ext === 'csv') {
+          const text = await new Promise((res, rej) => {
+            const r = new FileReader(); r.onload = e => res(e.target.result); r.onerror = rej; r.readAsText(file, 'UTF-8');
+          });
+          rows = parseCSV(text);
+        } else if (ext === 'xlsx' || ext === 'xls') {
+          const buf = await new Promise((res, rej) => {
+            const r = new FileReader(); r.onload = e => res(e.target.result); r.onerror = rej; r.readAsArrayBuffer(file);
+          });
+          rows = await parseExcel(buf);
+        } else { setErrorMsg(p => `${p ? p+'\n' : ''}不支援格式：${file.name}`); continue; }
+
+        const valid = rowsToData(rows, file.name);
+        allData.push(...valid);
+        newFiles.push({ name: file.name, count: valid.length, type: ext });
+      } catch(err) { setErrorMsg(p => `${p ? p+'\n' : ''}讀取 ${file.name} 失敗：${err.message || err}`); }
+    }
+
+    if (newFiles.length > 0) { setData(allData); setUploadedFiles(p => [...p, ...newFiles]); }
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    setIsLoading(false);
+  };
+
+  const handleClearData = () => {
+    if (!window.confirm('確定要清除所有資料嗎？')) return;
+    setData([]); setUploadedFiles([]); setSelectedEmployee(''); setSelectedProject('');
+    setSearchTerm(''); setSelectedDept('All'); setErrorMsg('');
+  };
+
+  const handleViewChange = mode => {
+    if (mode === 'department' && !deptUnlocked) {
+      setPwdInput(''); setPwdError(false); setShowPwdModal(true); return;
+    }
+    setViewMode(mode); setSearchTerm(''); setSelectedEmployee(''); setSelectedProject('');
+  };
+
+  const handlePwdSubmit = () => {
+    if (pwdInput === DEPT_PASSWORD) {
+      setDeptUnlocked(true); setShowPwdModal(false);
+      setViewMode('department'); setSearchTerm(''); setSelectedEmployee(''); setSelectedProject('');
+    } else { setPwdError(true); setPwdInput(''); }
+  };
+
+  // ── Derived Data ──
+  const departments = useMemo(() => {
+    const s = new Set();
+    data.forEach(d => { if(d._standardDepartment && d._standardDepartment !== '-' && d._standardDepartment !== '(空白)') s.add(d._standardDepartment); });
+    return Array.from(s).sort();
+  }, [data]);
+
+  const deptStats = useMemo(() => {
+    const map = new Map();
+    data.forEach(item => {
+      const n = item._standardDepartment;
+      if (!n || n === '-' || n === '(空白)') return;
+      const p = pv(item._standardPValue);
+      if (!map.has(n)) map.set(n, { name: n, totalPValue: p, members: new Set([item._standardName]), projects: new Set([item._standardProjectName]) });
+      else { const e = map.get(n); e.totalPValue += p; e.members.add(item._standardName); e.projects.add(item._standardProjectName); }
+    });
+    return Array.from(map.values()).map(d => ({ ...d, memberCount: d.members.size, projectCount: d.projects.size })).sort((a,b) => b.totalPValue - a.totalPValue);
+  }, [data]);
+
+  const filteredDepts = useMemo(() => {
+    let r = deptStats;
+    if (searchTerm) r = r.filter(d => d.name.toLowerCase().includes(searchTerm.toLowerCase()));
+    return r;
+  }, [deptStats, searchTerm]);
+
+  const deptData = useMemo(() => {
+    if (!selectedDept || selectedDept === 'All') return [];
+    return data.filter(item => {
+      if (item._standardDepartment !== selectedDept) return false;
+      const pn = item._standardProjectName;
+      if (pn.includes('合計') || item._standardDesc.includes('合計')) return false;
+      if (!item._fileName.includes('樞紐') && (!pn || pn === '-' || pn === '(空白)')) return false;
+      return true;
+    }).sort((a,b) => {
+      if (a._standardName !== b._standardName) return a._standardName.localeCompare(b._standardName, 'zh-TW');
+      return pv(b._standardPValue) - pv(a._standardPValue);
+    });
+  }, [data, selectedDept]);
+
+  const deptTotal   = useMemo(() => deptData.reduce((s,i) => s + pv(i._standardPValue), 0), [deptData]);
+  const deptEmpList = useMemo(() => { if (viewMode !== 'department' || !selectedDept || selectedDept === 'All') return []; const e = new Set(); deptData.forEach(i => e.add(i._standardName)); return Array.from(e).sort(); }, [deptData, viewMode, selectedDept]);
+
+  const filteredEmps = useMemo(() => {
+    const map = new Map();
+    data.forEach(item => { const n = item._standardName; if(n && n!=='教師名字') { if(!map.has(n)||(map.get(n)==='-'&&item._standardDepartment!=='-')) map.set(n,item._standardDepartment); } });
+    let r = Array.from(map.keys());
+    if (selectedDept !== 'All') { const s = new Set(data.filter(d => d._standardDepartment === selectedDept).map(d => d._standardName)); r = r.filter(n => s.has(n)); }
+    if (searchTerm) r = r.filter(e => e.toLowerCase().includes(searchTerm.toLowerCase()));
+    return r.sort();
+  }, [data, selectedDept, searchTerm]);
+
+  const empData  = useMemo(() => {
+    if (!selectedEmployee) return [];
+    return data.filter(item => {
+      if (item._standardName !== selectedEmployee) return false;
+      if (selectedDept !== 'All' && item._standardDepartment !== selectedDept) return false;
+      if (!item._fileName.includes('樞紐') && (!item._standardProjectName || item._standardProjectName==='-' || item._standardProjectName==='(空白)')) return false;
+      return true;
+    });
+  }, [data, selectedEmployee, selectedDept]);
+
+  const empTotal = useMemo(() => empData.reduce((s,i) => s + pv(i._standardPValue), 0), [empData]);
+
+  const projStats = useMemo(() => {
+    const map = new Map();
+    data.forEach(item => {
+      const pn = item._standardProjectName;
+      if (!pn || pn==='-' || pn==='(空白)') return;
+      const p = pv(item._standardPValue);
+      if (!map.has(pn)) map.set(pn, { name: pn, manager: item._standardProjectManager!=='-'?item._standardProjectManager:'', totalPValue: p, members: new Set([item._standardName]) });
+      else { const e = map.get(pn); e.totalPValue+=p; e.members.add(item._standardName); if(e.manager===''&&item._standardProjectManager!=='-') e.manager=item._standardProjectManager; }
+    });
+    return Array.from(map.values()).map(p => ({ ...p, memberCount: p.members.size, manager: p.manager||'-' })).sort((a,b) => b.totalPValue - a.totalPValue);
+  }, [data]);
+
+  const filteredProjs = useMemo(() => {
+    let r = projStats;
+    if (selectedDept !== 'All') { const vp = new Set(data.filter(d => d._standardDepartment===selectedDept).map(d => d._standardProjectName)); r = r.filter(p => vp.has(p.name)); }
+    if (searchTerm) r = r.filter(p => p.name.toLowerCase().includes(searchTerm.toLowerCase()));
+    return r;
+  }, [projStats, selectedDept, searchTerm, data]);
+
+  const projData  = useMemo(() => {
+    if (!selectedProject) return [];
+    return data.filter(item => {
+      if (item._standardProjectName !== selectedProject) return false;
+      if (selectedDept !== 'All' && item._standardDepartment !== selectedDept) return false;
+      return true;
+    }).sort((a,b) => pv(b._standardPValue) - pv(a._standardPValue));
+  }, [data, selectedProject, selectedDept]);
+
+  const projTotal = useMemo(() => projData.reduce((s,i) => s + pv(i._standardPValue), 0), [projData]);
+
+  const currentData  = useMemo(() => viewMode==='employee'?empData:viewMode==='project'?projData:deptData, [viewMode, empData, projData, deptData]);
+  const currentTotal = viewMode==='employee'?empTotal:viewMode==='project'?projTotal:deptTotal;
+  const currentTitle = viewMode==='employee'?selectedEmployee:viewMode==='project'?selectedProject:selectedDept;
+
+  const isEmpty = (viewMode==='employee'&&!selectedEmployee)||(viewMode==='project'&&!selectedProject)||(viewMode==='department'&&(selectedDept==='All'||!selectedDept));
+
+  // ── PDF 匯出 ──
+  const exportPDF = async (element, filename) => {
+    const prevVis = element.style.visibility;
+    element.style.visibility = 'visible';
+    await new Promise(r => setTimeout(r, 400));
+    const canvas = await window.html2canvas(element, { scale: 2, useCORS: true, logging: false, backgroundColor: '#ffffff', windowWidth: 2520 });
+    element.style.visibility = prevVis;
+    const imgData = canvas.toDataURL('image/jpeg', 0.95);
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a3' });
+    const W = pdf.internal.pageSize.getWidth(), H = pdf.internal.pageSize.getHeight();
+    const mX = 10, mY = 12, usableW = W - mX * 2;
+    const ratio = usableW / canvas.width;
+    const imgW = usableW, imgH = canvas.height * ratio;
+    let left = imgH, pos = mY, page = 1;
+    pdf.addImage(imgData, 'JPEG', mX, pos, imgW, imgH);
+    left -= (H - mY * 2);
+    while (left > 0 && page < 100) { pdf.addPage(); pos -= (H - mY * 2); pdf.addImage(imgData, 'JPEG', mX, pos, imgW, imgH); left -= (H - mY * 2); page++; }
+    pdf.save(filename);
+  };
+
+  const handleExportPDF = async () => {
+    if (!singleExpRef.current) return;
+    setIsExportingPDF(true);
+    try {
+      const prefix = viewMode==='employee'?selectedEmployee:viewMode==='project'?selectedProject:selectedDept;
+      const suffix = viewMode==='employee'?'績效明細':viewMode==='project'?'配額明細':'部門總覽明細';
+      await exportPDF(singleExpRef.current, `${prefix}_${suffix}.pdf`);
+    } catch(err) { alert('匯出 PDF 失敗：' + err.message); }
+    finally { setIsExportingPDF(false); }
+  };
+
+  const handleBatchExport = () => {
+    if (!deptEmpList.length) return;
+    if (!window.confirm(`即將下載 ${deptEmpList.length} 份 PDF。\n瀏覽器會詢問是否允許多檔下載，請選擇【允許】。`)) return;
+    batchRefs.current = {};
+    setBatchProgress({ current: 0, total: deptEmpList.length });
+    setBatchPhase('rendering');
+  };
+
+  const runBatchExport = async () => {
+    try {
+      for (let i = 0; i < deptEmpList.length; i++) {
+        const name = deptEmpList[i];
+        setBatchProgress(p => ({ ...p, current: i + 1 }));
+        const el = batchRefs.current[name];
+        if (!el) continue;
+        await exportPDF(el, `${name}_${selectedDept}_績效明細.pdf`);
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch(err) { alert('批次匯出錯誤：' + err.message); }
+    finally { setBatchPhase('idle'); setBatchProgress({ current: 0, total: 0 }); }
+  };
+
+  const isBatch = batchPhase !== 'idle';
+
+  // ── PDF 報表：表格樣式 ──
+  const ths = { padding:'18px 12px', fontSize:'15px', fontWeight:'bold', color:'#334155', borderBottom:'2px solid #94a3b8', backgroundColor:'#f8fafc', whiteSpace:'nowrap' };
+  const tds = { padding:'14px 12px', fontSize:'14px', color:'#475569', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' };
+  const tdn = { padding:'14px 12px', fontSize:'14px', color:'#475569', whiteSpace:'normal', wordBreak:'break-word' };
+
+  const PdfTable = ({ rows, mode }) => (
+    <div style={{ width:'2400px', background:'white' }}>
+      <table style={{ width:'100%', borderCollapse:'collapse', tableLayout:'fixed' }}>
+        <colgroup>
+          <col style={{ width:'120px' }}/>
+          {mode!=='project'&&<col style={{ width:'150px' }}/>}
+          <col style={{ width:'150px' }}/><col style={{ width:'100px' }}/>
+          <col style={{ width:'100px' }}/><col style={{ width:'150px' }}/>
+          {mode==='project'?<><col style={{ width:'250px' }}/><col style={{ width:'150px' }}/></>:<><col style={{ width:'150px' }}/><col style={{ width:'250px' }}/></>}
+          <col style={{ width:'120px' }}/><col style={{ width:'250px' }}/>
+          <col style={{ width:'450px' }}/><col style={{ width:'100px' }}/>
+          <col style={{ width:'150px' }}/><col style={{ width:'110px' }}/>
+        </colgroup>
+        <thead>
+          <tr>
+            <th style={ths}>部門</th>
+            {mode!=='project'&&<th style={ths}>專案屬性</th>}
+            <th style={ths}>類別</th><th style={ths}>配給</th>
+            <th style={ths}>派發</th><th style={ths}>評價方式</th>
+            {mode==='project'
+              ?<><th style={{...ths,whiteSpace:'normal'}}>專案名稱</th><th style={{...ths,color:'#4338ca',backgroundColor:'#e0e7ff'}}>教師</th></>
+              :<><th style={{...ths,...(mode==='department'&&{color:'#4338ca',backgroundColor:'#e0e7ff'})}}>教師名字</th><th style={{...ths,whiteSpace:'normal'}}>專案名稱</th></>}
+            <th style={ths}>負責人</th>
+            <th style={{...ths,whiteSpace:'normal'}}>項目/程序</th>
+            <th style={{...ths,whiteSpace:'normal'}}>工作內容敘述</th>
+            <th style={ths}>身份</th><th style={ths}>期間</th>
+            <th style={{...ths,textAlign:'right',backgroundColor:'#f1f5f9'}}>配額點數</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, idx) => {
+            const p = pv(row._standardPValue), dp = fmt(p);
+            const desc = (row._fileName.includes('樞紐')&&row._standardDesc===row._standardProjectName)?'-':row._standardDesc;
+            return (
+              <tr key={idx} style={{ borderBottom:'1px solid #e2e8f0' }}>
+                <td style={tds}>{row._standardDepartment}</td>
+                {mode!=='project'&&<td style={tds}>{row._standardProjectType}</td>}
+                <td style={tds}>{row._standardCategory}</td>
+                <td style={tds}>{row._standardAllocation}</td>
+                <td style={tds}>{row._standardDispatchStatus}</td>
+                <td style={tds}>{row._standardEvaluationMethod}</td>
+                {mode==='project'
+                  ?<><td style={{...tdn,fontWeight:'bold',color:'#0f172a'}}>{row._standardProjectName}</td><td style={{...tds,fontWeight:'bold',color:'#4338ca'}}>{row._standardName}</td></>
+                  :<><td style={{...tds,fontWeight:'600',color:mode==='department'?'#4338ca':'#1e293b'}}>{row._standardName}</td><td style={{...tdn,fontWeight:'bold',color:'#0f172a'}}>{row._standardProjectName}</td></>}
+                <td style={tds}>{row._standardProjectManager}</td>
+                <td style={tdn}>{row._standardProjectItem}</td>
+                <td style={{...tdn,lineHeight:'1.6'}}>{desc}</td>
+                <td style={tds}>{row._standardRole!=='-'?<span style={{padding:'5px 9px',borderRadius:'7px',fontSize:'12px',fontWeight:'bold',backgroundColor:'#f1f5f9',color:'#475569'}}>{row._standardRole}</span>:'-'}</td>
+                <td style={tdn}>{row._standardExecutionPeriod}</td>
+                <td style={{...tds,textAlign:'right',fontWeight:'900',color:'#4338ca',fontSize:'17px'}}>{dp}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+
+  const PdfHeader = ({ title, badge, total, extra }) => (
+    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-end', borderBottom:'3px solid #e2e8f0', paddingBottom:'28px', marginBottom:'28px' }}>
+      <div>
+        <div style={{ display:'flex', alignItems:'center', marginBottom:'14px' }}>
+          <h2 style={{ fontSize:'52px', fontWeight:'900', color:'#0f172a', margin:0, marginRight:'20px' }}>{title}</h2>
+          <span style={{ padding:'7px 14px', backgroundColor:'#e0e7ff', color:'#4338ca', fontSize:'19px', fontWeight:'bold', borderRadius:'11px' }}>{badge}</span>
+        </div>
+        <div style={{ fontSize:'18px', fontWeight:'500', color:'#64748b' }}>
+          <span>產出日期：{new Date().toLocaleDateString('zh-TW')}</span>
+          {selectedDept!=='All'&&viewMode!=='department'&&<span style={{ marginLeft:'22px', paddingLeft:'22px', borderLeft:'2px solid #cbd5e1' }}>部門：{selectedDept}</span>}
+        </div>
+      </div>
+      <div style={{ display:'flex', gap:'20px' }}>
+        {extra}
+        <div style={{ backgroundColor:'#e0e7ff', padding:'22px 44px', borderRadius:'22px', border:'1px solid #c7d2fe', textAlign:'center' }}>
+          <p style={{ fontSize:'15px', fontWeight:'bold', color:'#4338ca', textTransform:'uppercase', margin:'0 0 7px' }}>結算總點數</p>
+          <p style={{ fontSize:'52px', fontWeight:'900', color:'#4338ca', margin:0, lineHeight:1 }}>{total.toFixed(2)}</p>
+        </div>
+      </div>
+    </div>
+  );
+
+  const StatBox = ({ label, value }) => (
+    <div style={{ backgroundColor:'#f8fafc', padding:'22px 36px', borderRadius:'22px', border:'1px solid #e2e8f0', textAlign:'center' }}>
+      <p style={{ fontSize:'15px', fontWeight:'bold', color:'#64748b', textTransform:'uppercase', margin:'0 0 7px' }}>{label}</p>
+      <p style={{ fontSize:'44px', fontWeight:'900', color:'#1e293b', margin:0 }}>{value}</p>
+    </div>
+  );
+
+  // ── 主畫面 ──
+  if (data.length === 0) return (
+    <div className="min-h-screen bg-[#f4f7fb] flex flex-col">
+      {/* Header */}
+      <header className="bg-white/90 border-b border-slate-200 py-3 px-6 flex items-center shadow-sm">
+        <div className="w-9 h-9 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-md mr-3">
+          <Icon d={icons.Layout} size={18} className="text-white"/>
+        </div>
+        <div>
+          <h1 className="text-base font-bold text-slate-800 leading-tight">HR 專案績效系統</h1>
+          <p className="text-[9px] text-slate-400 uppercase tracking-widest">Performance & Quota Management</p>
+        </div>
+      </header>
+
+      {errorMsg && (
+        <div className="m-4 mb-0 p-3 bg-red-50 border border-red-200 rounded-xl flex items-center gap-2">
+          <Icon d={icons.Alert} size={15} className="text-red-500 shrink-0"/>
+          <span className="text-xs text-red-700 flex-1 whitespace-pre-line">{errorMsg}</span>
+          <button onClick={() => setErrorMsg('')} className="text-red-400 hover:text-red-600 font-bold">✕</button>
+        </div>
+      )}
+
+      <main className="flex-1 flex items-center justify-center p-6">
+        <div className="bg-white p-12 rounded-3xl shadow-lg max-w-xl w-full text-center border border-slate-100">
+          <div className="w-22 h-22 bg-gradient-to-tr from-indigo-50 to-blue-50 rounded-3xl flex items-center justify-center mx-auto mb-7 p-6">
+            {isLoading
+              ? <Icon d={icons.Loader} size={40} className="text-indigo-600 animate-spin"/>
+              : <Icon d={icons.Sheet} size={40} className="text-indigo-600"/>}
+          </div>
+          <h2 className="text-2xl font-extrabold text-slate-800 mb-3">匯入專案資料</h2>
+          <p className="text-slate-500 mb-5 text-sm leading-relaxed max-w-sm mx-auto">支援單筆或多筆報表上傳，系統自動解析並提供三重視角檢視。</p>
+          <div className="flex justify-center gap-2 mb-8">
+            {[['CSV','emerald'],['XLSX','blue'],['XLS','indigo']].map(([ext,c]) => (
+              <span key={ext} className={`px-3 py-0.5 rounded-full text-xs font-bold border bg-${c}-50 text-${c}-600 border-${c}-200`}>.{ext}</span>
+            ))}
+          </div>
+          <label className={`cursor-pointer inline-flex items-center gap-2.5 bg-slate-900 hover:bg-indigo-600 text-white font-semibold py-3.5 px-8 rounded-full transition-all shadow-xl hover:-translate-y-0.5 ${isLoading?'opacity-70 pointer-events-none':''}`}>
+            <Icon d={isLoading?icons.Loader:icons.Upload} size={18} className={isLoading?'animate-spin':''}/>
+            <span>{isLoading?'解析中...':'選擇檔案上傳'}</span>
+            <input type="file" accept=".csv,.xlsx,.xls" multiple className="hidden" ref={fileInputRef} onChange={handleFileUpload} disabled={isLoading}/>
+          </label>
+        </div>
+      </main>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-[#f4f7fb] flex flex-col" style={{height:'100vh'}}>
+      {/* Header */}
+      <header className="bg-white/90 backdrop-blur border-b border-slate-200 py-3 px-5 flex justify-between items-center sticky top-0 z-50 shadow-sm no-print">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-md">
+            <Icon d={icons.Layout} size={18} className="text-white"/>
+          </div>
+          <div>
+            <h1 className="text-base font-bold text-slate-800 leading-tight">HR 專案績效系統</h1>
+            <p className="text-[9px] text-slate-400 uppercase tracking-widest">Performance & Quota Management</p>
+          </div>
+        </div>
+        <button onClick={handleClearData} className="flex items-center gap-1.5 bg-white hover:bg-red-50 text-slate-600 hover:text-red-600 transition-all px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-200 hover:border-red-200 no-print">
+          <Icon d={icons.Trash} size={13}/><span>清空資料</span>
+        </button>
+      </header>
+
+      {errorMsg && (
+        <div className="m-3 mb-0 p-3 bg-red-50 border border-red-200 rounded-xl flex items-center gap-2 no-print">
+          <Icon d={icons.Alert} size={14} className="text-red-500 shrink-0"/>
+          <span className="text-xs text-red-700 flex-1 whitespace-pre-line">{errorMsg}</span>
+          <button onClick={() => setErrorMsg('')} className="text-red-400 hover:text-red-600 font-bold">✕</button>
+        </div>
+      )}
+
+      <main className="flex-1 flex overflow-hidden p-3 gap-3" style={{minHeight:0}}>
+        {/* ─── 左側邊欄 ─── */}
+        <aside className="w-[280px] bg-white rounded-2xl border border-slate-200 flex flex-col shadow-sm shrink-0 overflow-hidden no-print">
+          {/* 三頁籤 */}
+          <div className="p-2.5 border-b border-slate-100">
+            <div className="flex bg-slate-100 rounded-xl p-1 gap-0.5">
+              {[['employee','人員績效',icons.User],['project','專案後台',icons.Database],['department','部門總覽',icons.Building]].map(([key,label,ico]) => (
+                <button key={key} onClick={() => handleViewChange(key)}
+                  className={`flex-1 flex flex-col items-center py-1.5 text-[10px] font-bold rounded-lg transition-all ${viewMode===key?'bg-white shadow text-indigo-600':'text-slate-500 hover:text-slate-700'}`}>
+                  <div className="relative inline-flex">
+                    <Icon d={ico} size={13}/>
+                    {key==='department' && !deptUnlocked && (
+                      <span style={{position:'absolute',top:'-4px',right:'-6px',fontSize:'8px',lineHeight:1}}>🔒</span>
+                    )}
+                  </div>
+                  <span className="mt-0.5">{label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 篩選 */}
+          <div className="p-3 border-b border-slate-100 bg-slate-50/50 space-y-3">
+            {viewMode !== 'department' && (
+              <div>
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+                  <Icon d={icons.Filter} size={11}/>篩選部門
+                </label>
+                <div className="relative">
+                  <select value={selectedDept} onChange={e => { setSelectedDept(e.target.value); setSelectedEmployee(''); setSelectedProject(''); }}
+                    className="w-full appearance-none bg-white border border-slate-200 text-slate-700 text-xs font-medium rounded-xl focus:ring-2 focus:ring-indigo-400 py-2 pl-2.5 pr-7 outline-none cursor-pointer">
+                    <option value="All">全公司 (All)</option>
+                    {departments.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                  <Icon d={icons.Chevron} size={12} className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none rotate-90"/>
+                </div>
+              </div>
+            )}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                  {viewMode==='employee'?'員工名錄':viewMode==='project'?'專案列表':'部門列表'}
+                </label>
+                <span className="bg-indigo-50 text-indigo-600 text-[9px] font-bold px-1.5 py-0.5 rounded-full border border-indigo-100">
+                  {viewMode==='employee'?filteredEmps.length:viewMode==='project'?filteredProjs.length:filteredDepts.length}
+                </span>
+              </div>
+              <div className="relative">
+                <Icon d={icons.Search} size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400"/>
+                <input type="text"
+                  placeholder={viewMode==='employee'?'搜尋姓名...':viewMode==='project'?'搜尋專案...':'搜尋部門...'}
+                  value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
+                  className="w-full pl-8 pr-3 py-2 bg-white border border-slate-200 rounded-xl text-xs outline-none focus:ring-2 focus:ring-indigo-200 transition-all"/>
+              </div>
+            </div>
+          </div>
+
+          {/* 列表 */}
+          <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5 custom-scrollbar">
+            {viewMode==='employee' && (
+              filteredEmps.length === 0
+                ? <div className="text-center text-slate-400 mt-10 text-xs">找不到人員</div>
+                : filteredEmps.map(emp => (
+                  <button key={emp} onClick={() => setSelectedEmployee(emp)}
+                    className={`w-full text-left px-2.5 py-2 rounded-lg flex items-center justify-between text-xs font-medium transition-all ${selectedEmployee===emp?'bg-indigo-600 text-white shadow-md':'text-slate-600 hover:bg-indigo-50 hover:text-indigo-700'}`}>
+                    <span className="truncate">{emp}</span>
+                    {selectedEmployee===emp && <Icon d={icons.Chevron} size={12}/>}
+                  </button>
+                ))
+            )}
+            {viewMode==='project' && (
+              filteredProjs.length === 0
+                ? <div className="text-center text-slate-400 mt-10 text-xs">找不到專案</div>
+                : filteredProjs.map(proj => (
+                  <button key={proj.name} onClick={() => setSelectedProject(proj.name)}
+                    className={`w-full text-left px-2.5 py-1.5 rounded-lg flex flex-col transition-all border ${selectedProject===proj.name?'bg-indigo-600 text-white border-indigo-600 shadow-md':'bg-white text-slate-600 border-slate-100 hover:border-indigo-200 hover:bg-indigo-50/50'}`}>
+                    <span className={`text-[11px] font-bold truncate ${selectedProject===proj.name?'text-white':'text-slate-700'}`}>{proj.name}</span>
+                    <div className="flex justify-between items-center mt-1">
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded ${selectedProject===proj.name?'bg-white/20 text-indigo-100':'bg-slate-100 text-slate-500'}`}>{proj.memberCount} 人</span>
+                      <span className={`text-[10px] font-black ${selectedProject===proj.name?'text-indigo-100':'text-indigo-600'}`}>{proj.totalPValue.toFixed(2)}</span>
+                    </div>
+                  </button>
+                ))
+            )}
+            {viewMode==='department' && (
+              filteredDepts.length === 0
+                ? <div className="text-center text-slate-400 mt-10 text-xs">找不到部門</div>
+                : filteredDepts.map(dept => (
+                  <button key={dept.name} onClick={() => setSelectedDept(dept.name)}
+                    className={`w-full text-left px-2.5 py-1.5 rounded-lg flex flex-col transition-all border ${selectedDept===dept.name?'bg-indigo-600 text-white border-indigo-600 shadow-md':'bg-white text-slate-600 border-slate-100 hover:border-indigo-200 hover:bg-indigo-50/50'}`}>
+                    <span className={`text-[11px] font-bold truncate ${selectedDept===dept.name?'text-white':'text-slate-700'}`}>{dept.name}</span>
+                    <div className="flex justify-between items-center mt-1">
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded ${selectedDept===dept.name?'bg-white/20 text-indigo-100':'bg-slate-100 text-slate-500'}`}>{dept.memberCount}人/{dept.projectCount}專案</span>
+                      <span className={`text-[10px] font-black ${selectedDept===dept.name?'text-indigo-100':'text-indigo-600'}`}>{dept.totalPValue.toFixed(2)}</span>
+                    </div>
+                  </button>
+                ))
+            )}
+          </div>
+
+          {/* 上傳更多 */}
+          <div className="p-3 border-t border-slate-100 bg-slate-50/80 shrink-0">
+            <div className="flex justify-between mb-2">
+              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">已載入</span>
+              <span className="text-[9px] font-bold text-slate-400">{uploadedFiles.length} 份</span>
+            </div>
+            {uploadedFiles.length > 0 && (
+              <div className="mb-2 space-y-0.5 max-h-20 overflow-y-auto custom-scrollbar">
+                {uploadedFiles.map(f => (
+                  <div key={f.name} className="flex items-center justify-between text-[9px] text-slate-500 px-1">
+                    <span className="truncate max-w-[170px]" title={f.name}>{f.name}</span>
+                    <span className={`ml-1 px-1.5 py-0.5 rounded font-bold shrink-0 ${f.type==='csv'?'bg-emerald-50 text-emerald-600':'bg-blue-50 text-blue-600'}`}>{f.count}筆</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <label className={`w-full cursor-pointer bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 text-slate-600 hover:text-indigo-600 py-1.5 rounded-xl text-[10px] font-semibold flex justify-center items-center gap-1.5 transition-all ${isLoading?'opacity-50 pointer-events-none':''}`}>
+              <Icon d={icons.Upload} size={11}/>匯入更多 (.csv/.xlsx)
+              <input type="file" accept=".csv,.xlsx,.xls" multiple className="hidden" onChange={handleFileUpload} disabled={isLoading}/>
+            </label>
+          </div>
+        </aside>
+
+        {/* ─── 右側主區 ─── */}
+        <section className="flex-1 flex flex-col overflow-hidden" style={{minHeight:0}}>
+          {isEmpty ? (
+            <div className="m-auto flex flex-col items-center text-center p-8">
+              <div className="bg-white p-8 rounded-3xl shadow-sm mb-5 border border-slate-100 relative">
+                <div className="absolute -top-3 -right-3 w-7 h-7 bg-indigo-100 rounded-full flex items-center justify-center animate-bounce">
+                  <Icon d={icons.Star} size={13} className="text-indigo-500"/>
+                </div>
+                <Icon d={viewMode==='employee'?icons.User:viewMode==='project'?icons.PieChart:icons.Building} size={56} className="text-slate-200"/>
+              </div>
+              <h3 className="text-lg font-bold text-slate-700 mb-1">
+                {viewMode==='employee'?'選擇人員以檢視績效':viewMode==='project'?'選擇專案以檢視配額':'選擇部門以檢視總覽'}
+              </h3>
+              <p className="text-xs text-slate-400 max-w-xs leading-relaxed">點擊左側列表中的項目以生成可匯出的專業報表。</p>
+            </div>
+          ) : (
+            <div className="flex flex-col h-full">
+              {/* 操作列 */}
+              <div className="flex justify-between items-center mb-3 shrink-0 no-print">
+                <div className="flex items-center gap-2">
+                  <div className="w-1.5 h-5 bg-indigo-500 rounded-full"/>
+                  <span className="text-slate-700 font-bold text-sm">
+                    {viewMode==='employee'?'個人績效報表':viewMode==='project'?'專案配額報表':'部門績效總覽'}
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  {viewMode==='department' && deptEmpList.length > 0 && (
+                    <button onClick={handleBatchExport} disabled={isBatch||isExportingPDF}
+                      className={`flex items-center gap-2 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 px-4 py-2 rounded-xl text-xs font-bold transition-all ${isBatch?'opacity-70 cursor-wait':''}`}>
+                      {isBatch ? <Icon d={icons.Loader} size={13} className="animate-spin"/> : <Icon d={icons.CloudDl} size={13}/>}
+                      {isBatch ? `處理中 (${batchProgress.current}/${batchProgress.total})...` : `批次匯出單人 PDF (${deptEmpList.length}人)`}
+                    </button>
+                  )}
+                  <button onClick={handleExportPDF} disabled={isExportingPDF||isBatch}
+                    className={`flex items-center gap-2 bg-slate-900 text-white hover:bg-indigo-600 px-5 py-2 rounded-xl text-xs font-semibold transition-all shadow-md hover:-translate-y-0.5 ${isExportingPDF?'opacity-70 cursor-wait':''}`}>
+                    {isExportingPDF ? <Icon d={icons.Loader} size={13} className="animate-spin"/> : <Icon d={icons.Download} size={13}/>}
+                    {isExportingPDF ? '產生中...' : '匯出 PDF'}
+                  </button>
+                </div>
+              </div>
+
+              {/* 報表 */}
+              <div className="flex-1 overflow-y-auto overflow-x-auto custom-scrollbar rounded-2xl shadow-sm border border-slate-200 bg-white p-5 print-container" style={{minHeight:0}}>
+                <div className="min-w-max pb-6">
+                  {/* 報表標題 */}
+                  <div className="pb-5 border-b border-slate-200 mb-5 flex flex-col md:flex-row justify-between items-start md:items-end gap-4">
+                    <div>
+                      <div className="flex items-center gap-3 mb-2">
+                        <h2 className="text-2xl font-extrabold tracking-tight text-slate-900">{currentTitle}</h2>
+                        <span className="px-2.5 py-0.5 bg-indigo-50 text-indigo-700 text-xs font-bold rounded-lg border border-indigo-100">
+                          {viewMode==='employee'?'績效結算明細':viewMode==='project'?'配額分配明細':'部門總表'}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-3 text-xs text-slate-400">
+                        <span className="flex items-center gap-1">
+                          <Icon d={icons.File} size={12}/>產出日期：{new Date().toLocaleDateString('zh-TW')}
+                        </span>
+                        {selectedDept!=='All'&&viewMode!=='department'&&<span>· 篩選部門：{selectedDept}</span>}
+                      </div>
+                    </div>
+                    <div className="flex gap-3 shrink-0">
+                      {viewMode==='department' && <>
+                        <div className="bg-slate-50 rounded-xl px-4 py-2.5 text-center border border-slate-100">
+                          <p className="text-slate-400 text-[9px] font-bold uppercase tracking-widest mb-1">參與人數</p>
+                          <p className="text-xl font-black text-slate-800">{deptStats.find(d=>d.name===selectedDept)?.memberCount||0}</p>
+                        </div>
+                        <div className="bg-slate-50 rounded-xl px-4 py-2.5 text-center border border-slate-100">
+                          <p className="text-slate-400 text-[9px] font-bold uppercase tracking-widest mb-1">專案總數</p>
+                          <p className="text-xl font-black text-slate-800">{deptStats.find(d=>d.name===selectedDept)?.projectCount||0}</p>
+                        </div>
+                      </>}
+                      {viewMode==='project' && (
+                        <div className="bg-slate-50 rounded-xl px-4 py-2.5 text-center border border-slate-100">
+                          <p className="text-slate-400 text-[9px] font-bold uppercase tracking-widest mb-1">參與人數</p>
+                          <p className="text-xl font-black text-slate-800">{projStats.find(p=>p.name===selectedProject)?.memberCount||0}</p>
+                        </div>
+                      )}
+                      <div className="bg-indigo-50 rounded-xl px-6 py-2.5 text-center border border-indigo-100">
+                        <p className="text-indigo-500 text-[9px] font-bold uppercase tracking-widest mb-1">結算總點數</p>
+                        <p className="text-2xl font-black text-indigo-600">{currentTotal.toFixed(2)}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 資料表格 */}
+                  {currentData.length === 0
+                    ? <div className="py-16 text-center text-slate-400 text-sm">此條件下查無資料。</div>
+                    : <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr>
+                            {[
+                              ['部門','whitespace-nowrap'],
+                              ...(viewMode!=='project'?[['專案屬性','whitespace-nowrap']]:[]),
+                              ['類別','whitespace-nowrap'],['配給','whitespace-nowrap'],
+                              ['派發','whitespace-nowrap'],['評價方式','whitespace-nowrap'],
+                            ].map(([label,cls]) => (
+                              <th key={label} className={`bg-slate-50 text-slate-500 font-semibold py-2.5 px-2.5 text-[10px] border-y border-slate-200 ${cls}`}>{label}</th>
+                            ))}
+                            {viewMode==='project'
+                              ? <><th className="bg-slate-50 text-slate-700 font-bold py-2.5 px-2.5 text-[10px] border-y border-slate-200 min-w-[130px]">專案名稱</th><th className="bg-indigo-50 text-indigo-700 font-bold py-2.5 px-2.5 text-[10px] border-y border-indigo-100 whitespace-nowrap">教師</th></>
+                              : <><th className={`py-2.5 px-2.5 text-[10px] border-y whitespace-nowrap ${viewMode==='department'?'bg-indigo-50 text-indigo-700 font-bold border-indigo-100':'bg-slate-50 text-slate-500 font-semibold border-slate-200'}`}>教師名字</th><th className="bg-slate-50 text-slate-700 font-bold py-2.5 px-2.5 text-[10px] border-y border-slate-200 min-w-[130px]">專案名稱</th></>}
+                            {['負責人','項目/程序','工作內容敘述','身份','期間'].map(label => (
+                              <th key={label} className={`bg-slate-50 text-slate-500 font-semibold py-2.5 px-2.5 text-[10px] border-y border-slate-200 ${label==='工作內容敘述'?'min-w-[180px]':label==='項目/程序'?'min-w-[120px]':'whitespace-nowrap'}`}>{label}</th>
+                            ))}
+                            <th className="bg-slate-100 text-slate-700 font-bold py-2.5 px-2.5 text-[10px] border-y border-slate-200 text-right whitespace-nowrap">點數</th>
+                          </tr>
+                        </thead>
+                        <tbody className="bg-white">
+                          {currentData.map((row, idx) => {
+                            const dp = fmt(pv(row._standardPValue));
+                            const showDesc = (row._fileName.includes('樞紐')&&row._standardDesc===row._standardProjectName)?'-':row._standardDesc;
+                            return (
+                              <tr key={idx} className={`${viewMode==='project'?'hover:bg-blue-50/40':'hover:bg-indigo-50/40'} transition-colors border-b border-slate-100`}>
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardDepartment}</td>
+                                {viewMode!=='project'&&<td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardProjectType}</td>}
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardCategory}</td>
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardAllocation}</td>
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardDispatchStatus}</td>
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardEvaluationMethod}</td>
+                                {viewMode==='project'
+                                  ?<><td className="py-2 px-2.5 text-slate-700 text-xs font-semibold max-w-[180px] break-words whitespace-normal">{row._standardProjectName}</td><td className="py-2 px-2.5 text-indigo-700 text-xs font-bold bg-indigo-50/30 whitespace-nowrap">{row._standardName}</td></>
+                                  :<><td className={`py-2 px-2.5 text-xs whitespace-nowrap ${viewMode==='department'?'text-indigo-700 font-bold bg-indigo-50/30':'text-slate-800 font-medium'}`}>{row._standardName}</td><td className="py-2 px-2.5 text-slate-900 text-xs font-bold max-w-[180px] break-words whitespace-normal">{row._standardProjectName}</td></>}
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardProjectManager}</td>
+                                <td className="py-2 px-2.5 text-slate-600 text-xs max-w-[160px] break-words whitespace-normal">{row._standardProjectItem}</td>
+                                <td className="py-2 px-2.5 text-slate-600 text-xs leading-relaxed max-w-[250px] break-words whitespace-normal">
+                                  {showDesc!=='-'?showDesc:<span className="text-slate-300 italic">-</span>}
+                                </td>
+                                <td className="py-2 px-2.5 whitespace-nowrap">
+                                  {row._standardRole!=='-'
+                                    ?<span className={`inline-flex px-1.5 py-0.5 rounded text-[9px] font-bold ${viewMode==='project'?'bg-blue-100 text-blue-700':'bg-slate-100 text-slate-600'}`}>{row._standardRole}</span>
+                                    :'-'}
+                                </td>
+                                <td className="py-2 px-2.5 text-slate-500 text-xs whitespace-nowrap">{row._standardExecutionPeriod}</td>
+                                <td className="py-2 px-2.5 text-right font-black text-indigo-600 bg-slate-50/50 hover:bg-indigo-50/80 text-sm whitespace-nowrap">{dp}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>}
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+      </main>
+
+      {/* ─── PDF 虛擬渲染區（螢幕外） ─── */}
+      {/* 單張 */}
+      <div ref={singleExpRef} style={{
+        position:'fixed', top:0, left:'200vw', zIndex:-9999, pointerEvents:'none',
+        width:'2520px', backgroundColor:'white', padding:'60px', boxSizing:'border-box',
+        visibility: isExportingPDF ? 'visible' : 'hidden'
+      }}>
+        <PdfHeader
+          title={currentTitle}
+          badge={viewMode==='employee'?'績效結算明細':viewMode==='project'?'配額分配明細':'部門總表'}
+          total={currentTotal}
+          extra={
+            viewMode==='project' ? <StatBox label="參與人數" value={projStats.find(p=>p.name===selectedProject)?.memberCount||0}/>
+            : viewMode==='department' ? <><StatBox label="總參與人數" value={deptStats.find(d=>d.name===selectedDept)?.memberCount||0}/><StatBox label="專案總數" value={deptStats.find(d=>d.name===selectedDept)?.projectCount||0}/></>
+            : null
+          }
+        />
+        <PdfTable rows={currentData} mode={viewMode}/>
+      </div>
+
+      {/* 批次 */}
+      <div className={`batch-pdf-area ${(batchPhase==='rendering'||batchPhase==='exporting')?'rendering':''}`}>
+        {(batchPhase==='rendering'||batchPhase==='exporting') && deptEmpList.map(empName => {
+          const ed = data.filter(item => {
+            if (item._standardName !== empName) return false;
+            if (item._standardDepartment !== selectedDept) return false;
+            if (!item._fileName.includes('樞紐') && (!item._standardProjectName||item._standardProjectName==='-'||item._standardProjectName==='(空白)')) return false;
+            return true;
+          }).sort((a,b) => pv(b._standardPValue) - pv(a._standardPValue));
+          const et = ed.reduce((s,i) => s + pv(i._standardPValue), 0);
+          return (
+            <div key={empName} ref={el => { batchRefs.current[empName] = el; }}
+              style={{ width:'2520px', backgroundColor:'white', padding:'60px', boxSizing:'border-box', marginBottom:'40px' }}>
+              <PdfHeader title={empName} badge="績效結算明細" total={et} extra={<StatBox label="負責項目數" value={ed.length}/>}/>
+              <PdfTable rows={ed} mode="employee"/>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ─── 密碼輸入 Modal ─── */}
+      {showPwdModal && (
+        <div style={{position:'fixed',inset:0,backgroundColor:'rgba(15,23,42,0.55)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',backdropFilter:'blur(4px)'}}
+          onClick={e => { if(e.target===e.currentTarget){setShowPwdModal(false);} }}>
+          <div style={{backgroundColor:'white',borderRadius:'24px',padding:'40px 36px',width:'340px',boxShadow:'0 25px 60px rgba(0,0,0,0.18)',textAlign:'center'}}>
+            <div style={{width:'60px',height:'60px',background:'linear-gradient(135deg,#6366f1,#8b5cf6)',borderRadius:'18px',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 20px',fontSize:'26px'}}>🔒</div>
+            <h2 style={{fontSize:'18px',fontWeight:'800',color:'#0f172a',margin:'0 0 6px'}}>部門總覽</h2>
+            <p style={{fontSize:'12px',color:'#94a3b8',margin:'0 0 24px'}}>此區域受到保護，請輸入密碼以繼續。</p>
+            <input
+              type="password"
+              placeholder="請輸入密碼"
+              value={pwdInput}
+              onChange={e => { setPwdInput(e.target.value); setPwdError(false); }}
+              onKeyDown={e => e.key==='Enter' && handlePwdSubmit()}
+              autoFocus
+              style={{width:'100%',padding:'12px 16px',border:pwdError?'2px solid #ef4444':'2px solid #e2e8f0',borderRadius:'14px',fontSize:'14px',outline:'none',textAlign:'center',letterSpacing:'4px',boxSizing:'border-box',color:'#1e293b',marginBottom:'8px',transition:'border-color 0.2s'}}
+            />
+            {pwdError && <p style={{fontSize:'12px',color:'#ef4444',margin:'0 0 12px'}}>密碼錯誤，請重試。</p>}
+            {!pwdError && <div style={{height:'20px',marginBottom:'12px'}}/>}
+            <div style={{display:'flex',gap:'10px'}}>
+              <button onClick={() => setShowPwdModal(false)}
+                style={{flex:1,padding:'11px',borderRadius:'12px',border:'1px solid #e2e8f0',background:'white',color:'#64748b',fontWeight:'600',fontSize:'13px',cursor:'pointer'}}>
+                取消
+              </button>
+              <button onClick={handlePwdSubmit}
+                style={{flex:2,padding:'11px',borderRadius:'12px',border:'none',background:'linear-gradient(135deg,#6366f1,#8b5cf6)',color:'white',fontWeight:'700',fontSize:'13px',cursor:'pointer',boxShadow:'0 4px 14px rgba(99,102,241,0.4)'}}>
+                確認登入
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
